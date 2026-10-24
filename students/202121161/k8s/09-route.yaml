@@ -1,0 +1,18 @@
+# 외부 HTTPS 주소 (host는 OpenShift가 자동 생성)
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: smarthome-web
+  labels:
+    app: smarthome
+    component: web
+    app.kubernetes.io/part-of: smarthome
+spec:
+  to:
+    kind: Service
+    name: smarthome-web
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

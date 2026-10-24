@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}{{ plan.title }} · {{ config.APP_TITLE }}{% endblock %}
+{% block content %}
+<div class="result-head">
+  <div>
+    <p class="eyebrow">{{ (plan.created_at|string)[:16] }} 저장됨</p>
+    <h1 class="page-title">{{ plan.title }}</h1>
+    <div class="tags">
+      <span class="tag">{{ options.housing[house.housing] }}</span>
+      <span class="tag">{{ house.area }}평</span>
+      <span class="tag">침실 {{ house.rooms }}개</span>
+      {% for s in house.spaces %}<span class="tag">{{ options.spaces[s] }}</span>{% endfor %}
+      {% for h in house.household %}<span class="tag tag-accent">{{ options.household[h] }}</span>{% endfor %}
+      {% for p in house.priorities %}<span class="tag tag-accent">{{ options.priorities[p] }}</span>{% endfor %}
+    </div>
+  </div>
+  <div class="head-actions">
+    <a class="btn" href="{{ url_for('plan') }}">새 플랜</a>
+    <form method="post" action="{{ url_for('plan_delete', plan_id=plan.id) }}" onsubmit="return confirm('이 기록을 삭제할까요?')">
+      <button class="btn btn-ghost" type="submit">삭제</button>
+    </form>
+  </div>
+</div>
+
+<section class="stats">
+  <div class="stat"><span>추천 기기</span><strong>{{ result.count }}종</strong></div>
+  <div class="stat"><span>예산 내 구매</span><strong>{{ result.in_budget_total|won }}</strong></div>
+  <div class="stat"><span>전체 구성 비용</span><strong>{{ result.total|won }}</strong></div>
+  <div class="stat"><span>예산</span><strong>{{ budgets[house.budget].label }}</strong></div>
+</section>
+
+{% for group in result.groups %}
+<section class="group">
+  <h2>{{ group.label }}</h2>
+  <div class="grid">
+    {% for item in group["items"] %}
+    <article class="product{% if not item.in_budget %} over{% endif %}">
+      <img src="{{ url_for('static', filename=item.image) }}" alt="{{ item.name }}">
+      <div class="product-body">
+        <div class="product-top">
+          <h3>{{ item.name }}</h3>
+          {% if item.qty > 1 %}<span class="qty">× {{ item.qty }}</span>{% endif %}
+        </div>
+        <p class="desc">{{ item.desc }}</p>
+        <div class="reasons">{% for r in item.reasons %}<span>{{ r }}</span>{% endfor %}</div>
+        <div class="product-foot">
+          <strong>{{ item.subtotal|won }}</strong>
+          {% if item.in_budget %}<span class="badge ok">예산 내</span>{% else %}<span class="badge">추후 구매</span>{% endif %}
+        </div>
+      </div>
+    </article>
+    {% endfor %}
+  </div>
+</section>
+{% endfor %}
+{% endblock %}

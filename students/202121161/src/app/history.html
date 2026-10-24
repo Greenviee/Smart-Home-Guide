@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}내 기록 · {{ config.APP_TITLE }}{% endblock %}
+{% block content %}
+<h1 class="page-title">내 추천 기록</h1>
+{% if plans %}
+<div class="history">
+  {% for p in plans %}
+  <a class="history-item card" href="{{ url_for('plan_detail', plan_id=p.id) }}">
+    <div>
+      <h3>{{ p.title }}</h3>
+      <p class="muted">{{ options.housing[p.house.housing] }} · {{ p.house.area }}평 · 침실 {{ p.house.rooms }}개 · {{ (p.created_at|string)[:16] }}</p>
+    </div>
+    <div class="history-meta">
+      <span>{{ p.summary.count }}종</span>
+      <strong>{{ p.summary.total|won }}</strong>
+    </div>
+  </a>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty card">
+  <p>아직 저장된 추천 기록이 없습니다.</p>
+  <a class="btn" href="{{ url_for('plan') }}">첫 플랜 만들기</a>
+</div>
+{% endif %}
+{% endblock %}

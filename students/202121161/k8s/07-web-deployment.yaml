@@ -1,0 +1,108 @@
+# Flask 웹앱: UBI Python 이미지에 ConfigMap으로 코드를 주입해 실행 (이미지 빌드 없음)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smarthome-web
+  labels:
+    app: smarthome
+    component: web
+    app.kubernetes.io/part-of: smarthome
+    app.openshift.io/runtime: python
+  annotations:
+    app.openshift.io/connects-to: '[{"apiVersion":"apps/v1","kind":"Deployment","name":"smarthome-db"}]'
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: smarthome
+      component: web
+  template:
+    metadata:
+      labels:
+        app: smarthome
+        component: web
+    spec:
+      containers:
+        - name: web
+          image: registry.access.redhat.com/ubi9/python-311:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - >-
+              pip install --no-cache-dir --quiet --target /tmp/pylib
+              "flask>=3.0,<3.2" "psycopg2-binary>=2.9,<3"
+              && exec python /opt/app/app.py
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PYTHONPATH
+              value: /tmp/pylib
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: APP_DIR
+              value: /opt/app
+            - name: STATIC_DIR
+              value: /opt/static
+            - name: PORT
+              value: "8080"
+            - name: DB_HOST
+              value: smarthome-db
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: smarthome-db-secret
+                  key: database-name
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: smarthome-db-secret
+                  key: database-user
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: smarthome-db-secret
+                  key: database-password
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: smarthome-db-secret
+                  key: secret-key
+          volumeMounts:
+            - name: app
+              mountPath: /opt/app
+              readOnly: true
+            - name: static
+              mountPath: /opt/static
+              readOnly: true
+          startupProbe:               # pip 설치 + DB 연결 대기 시간 확보 (최대 5분)
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:              # 웹 프로세스가 응답하는지
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 20
+          readinessProbe:             # DB까지 연결돼야 Route 트래픽을 받음
+            httpGet:
+              path: /readyz
+              port: 8080
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+      volumes:
+        - name: app
+          configMap:
+            name: smarthome-app
+        - name: static
+          configMap:
+            name: smarthome-static

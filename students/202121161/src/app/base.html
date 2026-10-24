@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ config.APP_TITLE }}{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <link rel="icon" href="{{ url_for('static', filename='hub.svg') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <a class="brand" href="{{ url_for('index') }}">
+        <img src="{{ url_for('static', filename='hub.svg') }}" alt="">
+        <span>{{ config.APP_TITLE }}</span>
+      </a>
+      <nav class="nav">
+        <a href="{{ url_for('plan') }}">추천받기</a>
+        <a href="{{ url_for('history') }}">내 기록</a>
+        {% if current_user %}
+          <span class="user">{{ current_user }}님</span>
+          <a class="btn btn-ghost btn-sm" href="{{ url_for('logout') }}">로그아웃</a>
+        {% else %}
+          <a href="{{ url_for('login') }}">로그인</a>
+          <a class="btn btn-sm" href="{{ url_for('signup') }}">회원가입</a>
+        {% endif %}
+      </nav>
+    </div>
+  </header>
+
+  <main class="wrap">
+    {% with messages = get_flashed_messages() %}
+      {% for m in messages %}<div class="flash">{{ m }}</div>{% endfor %}
+    {% endwith %}
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="footer">
+    <div class="wrap">PNU 지능형IoT플랫폼 · 나만의 컨테이너 과제 · 가격은 참고용 예상가입니다.</div>
+  </footer>
+</body>
+</html>

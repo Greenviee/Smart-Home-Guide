@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}추천받기 · {{ config.APP_TITLE }}{% endblock %}
+{% block content %}
+<h1 class="page-title">우리 집 정보 입력</h1>
+<form method="post" class="plan-form">
+  <fieldset class="card">
+    <legend>플랜 이름</legend>
+    <input name="title" maxlength="50" placeholder="예: 부산 신혼집 24평" value="{{ title }}">
+  </fieldset>
+
+  <fieldset class="card">
+    <legend>집 구조</legend>
+    <p class="field-label">주거 형태</p>
+    <div class="chips">
+      {% for key, label in options.housing.items() %}
+        <label class="chip"><input type="radio" name="housing" value="{{ key }}" {% if house.housing == key %}checked{% endif %}><span>{{ label }}</span></label>
+      {% endfor %}
+    </div>
+    <div class="row">
+      <label>평수<input type="number" name="area" min="5" max="200" value="{{ house.area }}"></label>
+      <label>침실 개수<input type="number" name="rooms" min="1" max="8" value="{{ house.rooms }}"></label>
+    </div>
+    <p class="field-label">있는 공간 (복수 선택)</p>
+    <div class="chips">
+      {% for key, label in options.spaces.items() %}
+        <label class="chip"><input type="checkbox" name="spaces" value="{{ key }}" {% if key in house.spaces %}checked{% endif %}><span>{{ label }}</span></label>
+      {% endfor %}
+    </div>
+  </fieldset>
+
+  <fieldset class="card">
+    <legend>생활 조건</legend>
+    <p class="field-label">가족 구성 (해당 시 선택)</p>
+    <div class="chips">
+      {% for key, label in options.household.items() %}
+        <label class="chip"><input type="checkbox" name="household" value="{{ key }}" {% if key in house.household %}checked{% endif %}><span>{{ label }}</span></label>
+      {% endfor %}
+    </div>
+    <p class="field-label">중요하게 생각하는 것</p>
+    <div class="chips">
+      {% for key, label in options.priorities.items() %}
+        <label class="chip"><input type="checkbox" name="priorities" value="{{ key }}" {% if key in house.priorities %}checked{% endif %}><span>{{ label }}</span></label>
+      {% endfor %}
+    </div>
+    <p class="field-label">예산</p>
+    <div class="chips">
+      {% for key, b in budgets.items() %}
+        <label class="chip"><input type="radio" name="budget" value="{{ key }}" {% if house.budget == key %}checked{% endif %}><span>{{ b.label }}</span></label>
+      {% endfor %}
+    </div>
+  </fieldset>
+
+  <button class="btn btn-lg" type="submit">추천 결과 보기</button>
+</form>
+{% endblock %}

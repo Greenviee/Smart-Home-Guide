@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}로그인 · {{ config.APP_TITLE }}{% endblock %}
+{% block content %}
+<section class="auth card">
+  <h1>로그인</h1>
+  <form method="post">
+    <label>아이디<input name="username" required autocomplete="username"></label>
+    <label>비밀번호<input name="password" type="password" required autocomplete="current-password"></label>
+    <button class="btn btn-block" type="submit">로그인</button>
+  </form>
+  <p class="muted">계정이 없으신가요? <a href="{{ url_for('signup') }}">회원가입</a></p>
+</section>
+{% endblock %}

@@ -1,0 +1,70 @@
+# PostgreSQL 15 (비루트 실행을 지원하는 sclorg 이미지)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smarthome-db
+  labels:
+    app: smarthome
+    component: db
+    app.kubernetes.io/part-of: smarthome
+    app.openshift.io/runtime: postgresql
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate            # RWO PVC는 한 Pod만 붙을 수 있으므로 기존 Pod를 먼저 내림
+  selector:
+    matchLabels:
+      app: smarthome
+      component: db
+  template:
+    metadata:
+      labels:
+        app: smarthome
+        component: db
+    spec:
+      containers:
+        - name: postgresql
+          image: quay.io/sclorg/postgresql-15-c9s:latest
+          ports:
+            - name: postgresql
+              containerPort: 5432
+          env:
+            - name: POSTGRESQL_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: smarthome-db-secret
+                  key: database-name
+            - name: POSTGRESQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: smarthome-db-secret
+                  key: database-user
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: smarthome-db-secret
+                  key: database-password
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/pgsql/data
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pg_isready -h 127.0.0.1 -p 5432 -U \"$POSTGRESQL_USER\""]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 5432
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: smarthome-db-pvc

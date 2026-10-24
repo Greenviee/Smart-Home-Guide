@@ -1,0 +1,728 @@
+# Flask 앱 코드, HTML 템플릿, 추천 규칙
+# 자동 생성 파일: src/app/ 를 수정한 뒤 src/build_configmaps.py 를 실행하세요.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smarthome-app
+  labels:
+    app: smarthome
+    app.kubernetes.io/part-of: smarthome
+data:
+  app.py: |
+    """스마트홈 가이드 - 집 구조를 입력받아 규칙 기반으로 스마트홈 제품을 추천하는 웹 서비스.
+
+    - DB_HOST 환경변수가 있으면 PostgreSQL(OpenShift), 없으면 SQLite(로컬 개발)를 사용한다.
+    - 추천 규칙은 rules.json(ConfigMap)에서 읽는다.
+    """
+    import json
+    import os
+    import re
+    import sqlite3
+    import time
+    from datetime import datetime, timedelta, timezone
+    from functools import wraps
+
+    from flask import (Flask, abort, flash, g, redirect, render_template, request,
+                       session, url_for)
+    from werkzeug.security import check_password_hash, generate_password_hash
+
+    APP_DIR = os.environ.get("APP_DIR", os.path.dirname(os.path.abspath(__file__)))
+    STATIC_DIR = os.environ.get("STATIC_DIR", os.path.join(APP_DIR, "..", "static"))
+    RULES_PATH = os.environ.get("RULES_PATH", os.path.join(APP_DIR, "rules.json"))
+
+    DB_HOST = os.environ.get("DB_HOST")
+    USE_PG = bool(DB_HOST)
+    SQLITE_PATH = os.environ.get("SQLITE_PATH", os.path.join(APP_DIR, "..", "local.db"))
+
+    app = Flask(__name__, template_folder=APP_DIR, static_folder=STATIC_DIR)
+    app.secret_key = os.environ.get("SECRET_KEY", "local-dev-secret")
+    app.config["APP_TITLE"] = os.environ.get("APP_TITLE", "스마트홈 가이드")
+
+    with open(RULES_PATH, encoding="utf-8") as f:
+        RULES = json.load(f)
+
+    USERNAME_RE = re.compile(r"^[a-zA-Z0-9_]{3,20}$")
+    KST = timezone(timedelta(hours=9))
+
+
+    # ---------------------------------------------------------------- DB
+
+    SCHEMA_PG = """
+    CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(20) UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS plans (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title VARCHAR(50) NOT NULL,
+        house_input TEXT NOT NULL,
+        result TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """
+
+    SCHEMA_SQLITE = """
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username VARCHAR(20) UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS plans (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title VARCHAR(50) NOT NULL,
+        house_input TEXT NOT NULL,
+        result TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """
+
+
+    def connect():
+        if USE_PG:
+            import psycopg2
+            return psycopg2.connect(
+                host=DB_HOST,
+                port=int(os.environ.get("DB_PORT", "5432")),
+                dbname=os.environ.get("DB_NAME", "smarthome"),
+                user=os.environ.get("DB_USER", "smarthome"),
+                password=os.environ.get("DB_PASSWORD", ""),
+                connect_timeout=3,
+            )
+        conn = sqlite3.connect(SQLITE_PATH)
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+
+    def get_db():
+        if "db" not in g:
+            g.db = connect()
+        return g.db
+
+
+    @app.teardown_appcontext
+    def close_db(_exc):
+        db = g.pop("db", None)
+        if db is not None:
+            db.close()
+
+
+    def query(sql, params=(), one=False, commit=False):
+        """SQL은 SQLite 형식(?)으로 작성하고, PostgreSQL이면 %s로 바꿔 실행한다."""
+        if USE_PG:
+            sql = sql.replace("?", "%s")
+        db = get_db()
+        cur = db.cursor()
+        cur.execute(sql, params)
+        rows = []
+        if cur.description:
+            cols = [c[0] for c in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        if commit:
+            db.commit()
+        cur.close()
+        return (rows[0] if rows else None) if one else rows
+
+
+    def init_db(retries=30, delay=2):
+        """DB Pod가 먼저 뜨지 않았을 수 있으므로 연결될 때까지 재시도한 뒤 테이블을 만든다."""
+        for attempt in range(1, retries + 1):
+            try:
+                conn = connect()
+                break
+            except Exception as e:  # noqa: BLE001
+                print(f"[init_db] DB 연결 대기 중 ({attempt}/{retries}): {e}", flush=True)
+                time.sleep(delay)
+        else:
+            raise RuntimeError("DB에 연결할 수 없습니다.")
+        cur = conn.cursor()
+        if USE_PG:
+            cur.execute(SCHEMA_PG)
+        else:
+            cur.executescript(SCHEMA_SQLITE)
+        conn.commit()
+        conn.close()
+        print(f"[init_db] 준비 완료 ({'PostgreSQL' if USE_PG else 'SQLite'})", flush=True)
+
+
+    # ---------------------------------------------------------------- 추천 엔진
+
+    def matches(cond, house):
+        if cond.get("always"):
+            return True
+        if "space" in cond and cond["space"] not in house["spaces"]:
+            return False
+        if "household" in cond and cond["household"] not in house["household"]:
+            return False
+        if "priority" in cond and cond["priority"] not in house["priorities"]:
+            return False
+        if "housing" in cond and house["housing"] not in cond["housing"]:
+            return False
+        if "min_area" in cond and house["area"] < cond["min_area"]:
+            return False
+        if "min_rooms" in cond and house["rooms"] < cond["min_rooms"]:
+            return False
+        return True
+
+
+    def resolve_qty(qty, house):
+        if qty == "rooms":
+            return max(1, house["rooms"])
+        return int(qty)
+
+
+    def recommend(house):
+        """규칙을 위에서부터 적용해 공간(group)별 추천 목록을 만들고 예산에 맞춰 표시한다."""
+        products = RULES["products"]
+        picked = {}  # product_id -> item
+        for rule in RULES["rules"]:
+            if not matches(rule["when"], house):
+                continue
+            for entry in rule["products"]:
+                pid, qty = entry["id"], resolve_qty(entry.get("qty", 1), house)
+                if pid in picked:
+                    item = picked[pid]
+                    item["qty"] = max(item["qty"], qty)
+                    if rule["reason"] not in item["reasons"]:
+                        item["reasons"].append(rule["reason"])
+                    continue
+                p = products[pid]
+                picked[pid] = {
+                    "id": pid,
+                    "name": p["name"],
+                    "desc": p["desc"],
+                    "image": p["image"],
+                    "price": p["price"],
+                    "priority": p["priority"],
+                    "group": rule["group"],
+                    "qty": qty,
+                    "reasons": [rule["reason"]],
+                }
+
+        budget = RULES["budgets"][house["budget"]]["limit"]
+        total = 0
+        in_budget_total = 0
+        for item in sorted(picked.values(), key=lambda x: (x["priority"], x["price"])):
+            item["subtotal"] = item["price"] * item["qty"]
+            total += item["subtotal"]
+            if budget is None or in_budget_total + item["subtotal"] <= budget:
+                item["in_budget"] = True
+                in_budget_total += item["subtotal"]
+            else:
+                item["in_budget"] = False
+
+        groups = []
+        for gid in RULES["group_order"]:
+            items = [i for i in picked.values() if i["group"] == gid]
+            if items:
+                items.sort(key=lambda x: (not x["in_budget"], x["priority"]))
+                groups.append({"id": gid, "label": RULES["groups"][gid], "items": items})
+
+        return {
+            "groups": groups,
+            "count": len(picked),
+            "total": total,
+            "in_budget_total": in_budget_total,
+            "budget": budget,
+        }
+
+
+    DEFAULT_HOUSE = {
+        "housing": "apartment", "area": 24, "rooms": 2,
+        "spaces": ["living", "kitchen", "bedroom", "bathroom", "entrance"],
+        "household": [], "priorities": [], "budget": "mid",
+    }
+
+
+    def parse_house(form):
+        def as_int(name, lo, hi, default):
+            try:
+                return min(hi, max(lo, int(form.get(name, default))))
+            except ValueError:
+                return default
+
+        options = RULES["options"]
+        housing = form.get("housing", "apartment")
+        budget = form.get("budget", "mid")
+        return {
+            "housing": housing if housing in options["housing"] else "apartment",
+            "area": as_int("area", 5, 200, 24),
+            "rooms": as_int("rooms", 1, 8, 2),
+            "spaces": [s for s in form.getlist("spaces") if s in options["spaces"]],
+            "household": [h for h in form.getlist("household") if h in options["household"]],
+            "priorities": [p for p in form.getlist("priorities") if p in options["priorities"]],
+            "budget": budget if budget in RULES["budgets"] else "mid",
+        }
+
+
+    @app.template_filter("won")
+    def won(value):
+        return f"{value:,}원"
+
+
+    @app.context_processor
+    def inject_globals():
+        return {"options": RULES["options"], "budgets": RULES["budgets"],
+                "current_user": session.get("username")}
+
+
+    # ---------------------------------------------------------------- 인증
+
+    def login_required(view):
+        @wraps(view)
+        def wrapper(*args, **kwargs):
+            if "user_id" not in session:
+                flash("로그인이 필요합니다.")
+                return redirect(url_for("login", next=request.path))
+            return view(*args, **kwargs)
+        return wrapper
+
+
+    @app.route("/signup", methods=["GET", "POST"])
+    def signup():
+        if request.method == "POST":
+            username = request.form.get("username", "").strip()
+            password = request.form.get("password", "")
+            if not USERNAME_RE.match(username):
+                flash("아이디는 영문, 숫자, _ 로 3~20자여야 합니다.")
+            elif len(password) < 6:
+                flash("비밀번호는 6자 이상이어야 합니다.")
+            elif query("SELECT id FROM users WHERE username = ?", (username,), one=True):
+                flash("이미 사용 중인 아이디입니다.")
+            else:
+                query("INSERT INTO users (username, password_hash) VALUES (?, ?)",
+                      (username, generate_password_hash(password)), commit=True)
+                flash("가입이 완료되었습니다. 로그인해 주세요.")
+                return redirect(url_for("login"))
+        return render_template("signup.html")
+
+
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        if request.method == "POST":
+            username = request.form.get("username", "").strip()
+            password = request.form.get("password", "")
+            user = query("SELECT id, username, password_hash FROM users WHERE username = ?",
+                         (username,), one=True)
+            if user and check_password_hash(user["password_hash"], password):
+                session.clear()
+                session["user_id"] = user["id"]
+                session["username"] = user["username"]
+                next_url = request.args.get("next", "")
+                return redirect(next_url if next_url.startswith("/") else url_for("plan"))
+            flash("아이디 또는 비밀번호가 올바르지 않습니다.")
+        return render_template("login.html")
+
+
+    @app.route("/logout")
+    def logout():
+        session.clear()
+        return redirect(url_for("index"))
+
+
+    # ---------------------------------------------------------------- 페이지
+
+    @app.route("/")
+    def index():
+        return render_template("index.html")
+
+
+    @app.route("/plan", methods=["GET", "POST"])
+    @login_required
+    def plan():
+        if request.method == "POST":
+            house = parse_house(request.form)
+            title = request.form.get("title", "").strip()[:50] or "우리집 스마트홈 플랜"
+            if not house["spaces"]:
+                flash("공간을 하나 이상 선택해 주세요.")
+                return render_template("plan.html", house=house, title=title)
+            result = recommend(house)
+            row = query(
+                "INSERT INTO plans (user_id, title, house_input, result, created_at) "
+                "VALUES (?, ?, ?, ?, ?) RETURNING id",
+                (session["user_id"], title, json.dumps(house, ensure_ascii=False),
+                 json.dumps(result, ensure_ascii=False),
+                 datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")),
+                one=True, commit=True)
+            return redirect(url_for("plan_detail", plan_id=row["id"]))
+        return render_template("plan.html", house=DEFAULT_HOUSE, title="")
+
+
+    @app.route("/history")
+    @login_required
+    def history():
+        plans = query(
+            "SELECT id, title, house_input, result, created_at FROM plans "
+            "WHERE user_id = ? ORDER BY id DESC", (session["user_id"],))
+        for p in plans:
+            p["house"] = json.loads(p["house_input"])
+            p["summary"] = json.loads(p["result"])
+        return render_template("history.html", plans=plans)
+
+
+    def load_plan(plan_id):
+        row = query("SELECT * FROM plans WHERE id = ? AND user_id = ?",
+                    (plan_id, session["user_id"]), one=True)
+        if row is None:
+            abort(404)
+        return row
+
+
+    @app.route("/history/<int:plan_id>")
+    @login_required
+    def plan_detail(plan_id):
+        row = load_plan(plan_id)
+        return render_template("result.html", plan=row,
+                               house=json.loads(row["house_input"]),
+                               result=json.loads(row["result"]))
+
+
+    @app.route("/history/<int:plan_id>/delete", methods=["POST"])
+    @login_required
+    def plan_delete(plan_id):
+        load_plan(plan_id)
+        query("DELETE FROM plans WHERE id = ? AND user_id = ?",
+              (plan_id, session["user_id"]), commit=True)
+        flash("기록을 삭제했습니다.")
+        return redirect(url_for("history"))
+
+
+    # ---------------------------------------------------------------- Probe
+
+    @app.route("/healthz")
+    def healthz():
+        """Liveness: 웹 프로세스가 살아 있는지만 확인."""
+        return {"status": "ok"}
+
+
+    @app.route("/readyz")
+    def readyz():
+        """Readiness: DB까지 연결되어야 트래픽을 받는다."""
+        try:
+            query("SELECT 1 AS ok", one=True)
+            return {"status": "ready", "db": "postgresql" if USE_PG else "sqlite"}
+        except Exception as e:  # noqa: BLE001
+            return {"status": "not ready", "error": str(e)}, 503
+
+
+    if __name__ == "__main__":
+        init_db()
+        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")), threaded=True)
+  base.html: |
+    <!doctype html>
+    <html lang="ko">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>{% block title %}{{ config.APP_TITLE }}{% endblock %}</title>
+      <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+      <link rel="icon" href="{{ url_for('static', filename='hub.svg') }}">
+    </head>
+    <body>
+      <header class="topbar">
+        <div class="wrap topbar-inner">
+          <a class="brand" href="{{ url_for('index') }}">
+            <img src="{{ url_for('static', filename='hub.svg') }}" alt="">
+            <span>{{ config.APP_TITLE }}</span>
+          </a>
+          <nav class="nav">
+            <a href="{{ url_for('plan') }}">추천받기</a>
+            <a href="{{ url_for('history') }}">내 기록</a>
+            {% if current_user %}
+              <span class="user">{{ current_user }}님</span>
+              <a class="btn btn-ghost btn-sm" href="{{ url_for('logout') }}">로그아웃</a>
+            {% else %}
+              <a href="{{ url_for('login') }}">로그인</a>
+              <a class="btn btn-sm" href="{{ url_for('signup') }}">회원가입</a>
+            {% endif %}
+          </nav>
+        </div>
+      </header>
+
+      <main class="wrap">
+        {% with messages = get_flashed_messages() %}
+          {% for m in messages %}<div class="flash">{{ m }}</div>{% endfor %}
+        {% endwith %}
+        {% block content %}{% endblock %}
+      </main>
+
+      <footer class="footer">
+        <div class="wrap">PNU 지능형IoT플랫폼 · 나만의 컨테이너 과제 · 가격은 참고용 예상가입니다.</div>
+      </footer>
+    </body>
+    </html>
+  history.html: |
+    {% extends "base.html" %}
+    {% block title %}내 기록 · {{ config.APP_TITLE }}{% endblock %}
+    {% block content %}
+    <h1 class="page-title">내 추천 기록</h1>
+    {% if plans %}
+    <div class="history">
+      {% for p in plans %}
+      <a class="history-item card" href="{{ url_for('plan_detail', plan_id=p.id) }}">
+        <div>
+          <h3>{{ p.title }}</h3>
+          <p class="muted">{{ options.housing[p.house.housing] }} · {{ p.house.area }}평 · 침실 {{ p.house.rooms }}개 · {{ (p.created_at|string)[:16] }}</p>
+        </div>
+        <div class="history-meta">
+          <span>{{ p.summary.count }}종</span>
+          <strong>{{ p.summary.total|won }}</strong>
+        </div>
+      </a>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty card">
+      <p>아직 저장된 추천 기록이 없습니다.</p>
+      <a class="btn" href="{{ url_for('plan') }}">첫 플랜 만들기</a>
+    </div>
+    {% endif %}
+    {% endblock %}
+  index.html: |
+    {% extends "base.html" %}
+    {% block content %}
+    <section class="hero">
+      <div class="hero-text">
+        <p class="eyebrow">Smart Home Guide</p>
+        <h1>우리 집 구조에 맞는<br>스마트홈 구성을 추천해 드립니다</h1>
+        <p class="lead">주거 형태, 평수, 공간, 가족 구성, 예산을 입력하면 공간별로 필요한 스마트홈 기기와 예상 비용을 정리해 드립니다. 추천 결과는 계정에 저장되어 언제든 다시 볼 수 있습니다.</p>
+        <div class="hero-actions">
+          <a class="btn" href="{{ url_for('plan') }}">지금 추천받기</a>
+          {% if not current_user %}<a class="btn btn-ghost" href="{{ url_for('signup') }}">회원가입</a>{% endif %}
+        </div>
+      </div>
+      <div class="hero-art">
+        {% for img in ['doorlock', 'light', 'air', 'cctv', 'leak', 'speaker'] %}
+          <img src="{{ url_for('static', filename=img ~ '.svg') }}" alt="">
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="steps">
+      <div class="step"><span>1</span><h3>집 구조 입력</h3><p>주거 형태, 평수, 방 개수, 보유 공간을 선택합니다.</p></div>
+      <div class="step"><span>2</span><h3>생활 조건 선택</h3><p>반려동물·노약자 같은 가족 구성과 보안·절약 같은 우선순위, 예산을 고릅니다.</p></div>
+      <div class="step"><span>3</span><h3>추천 확인·저장</h3><p>공간별 추천 기기, 추천 이유, 예산 내 구매 순서를 확인하고 기록으로 남깁니다.</p></div>
+    </section>
+    {% endblock %}
+  login.html: |
+    {% extends "base.html" %}
+    {% block title %}로그인 · {{ config.APP_TITLE }}{% endblock %}
+    {% block content %}
+    <section class="auth card">
+      <h1>로그인</h1>
+      <form method="post">
+        <label>아이디<input name="username" required autocomplete="username"></label>
+        <label>비밀번호<input name="password" type="password" required autocomplete="current-password"></label>
+        <button class="btn btn-block" type="submit">로그인</button>
+      </form>
+      <p class="muted">계정이 없으신가요? <a href="{{ url_for('signup') }}">회원가입</a></p>
+    </section>
+    {% endblock %}
+  plan.html: |
+    {% extends "base.html" %}
+    {% block title %}추천받기 · {{ config.APP_TITLE }}{% endblock %}
+    {% block content %}
+    <h1 class="page-title">우리 집 정보 입력</h1>
+    <form method="post" class="plan-form">
+      <fieldset class="card">
+        <legend>플랜 이름</legend>
+        <input name="title" maxlength="50" placeholder="예: 부산 신혼집 24평" value="{{ title }}">
+      </fieldset>
+
+      <fieldset class="card">
+        <legend>집 구조</legend>
+        <p class="field-label">주거 형태</p>
+        <div class="chips">
+          {% for key, label in options.housing.items() %}
+            <label class="chip"><input type="radio" name="housing" value="{{ key }}" {% if house.housing == key %}checked{% endif %}><span>{{ label }}</span></label>
+          {% endfor %}
+        </div>
+        <div class="row">
+          <label>평수<input type="number" name="area" min="5" max="200" value="{{ house.area }}"></label>
+          <label>침실 개수<input type="number" name="rooms" min="1" max="8" value="{{ house.rooms }}"></label>
+        </div>
+        <p class="field-label">있는 공간 (복수 선택)</p>
+        <div class="chips">
+          {% for key, label in options.spaces.items() %}
+            <label class="chip"><input type="checkbox" name="spaces" value="{{ key }}" {% if key in house.spaces %}checked{% endif %}><span>{{ label }}</span></label>
+          {% endfor %}
+        </div>
+      </fieldset>
+
+      <fieldset class="card">
+        <legend>생활 조건</legend>
+        <p class="field-label">가족 구성 (해당 시 선택)</p>
+        <div class="chips">
+          {% for key, label in options.household.items() %}
+            <label class="chip"><input type="checkbox" name="household" value="{{ key }}" {% if key in house.household %}checked{% endif %}><span>{{ label }}</span></label>
+          {% endfor %}
+        </div>
+        <p class="field-label">중요하게 생각하는 것</p>
+        <div class="chips">
+          {% for key, label in options.priorities.items() %}
+            <label class="chip"><input type="checkbox" name="priorities" value="{{ key }}" {% if key in house.priorities %}checked{% endif %}><span>{{ label }}</span></label>
+          {% endfor %}
+        </div>
+        <p class="field-label">예산</p>
+        <div class="chips">
+          {% for key, b in budgets.items() %}
+            <label class="chip"><input type="radio" name="budget" value="{{ key }}" {% if house.budget == key %}checked{% endif %}><span>{{ b.label }}</span></label>
+          {% endfor %}
+        </div>
+      </fieldset>
+
+      <button class="btn btn-lg" type="submit">추천 결과 보기</button>
+    </form>
+    {% endblock %}
+  result.html: |
+    {% extends "base.html" %}
+    {% block title %}{{ plan.title }} · {{ config.APP_TITLE }}{% endblock %}
+    {% block content %}
+    <div class="result-head">
+      <div>
+        <p class="eyebrow">{{ (plan.created_at|string)[:16] }} 저장됨</p>
+        <h1 class="page-title">{{ plan.title }}</h1>
+        <div class="tags">
+          <span class="tag">{{ options.housing[house.housing] }}</span>
+          <span class="tag">{{ house.area }}평</span>
+          <span class="tag">침실 {{ house.rooms }}개</span>
+          {% for s in house.spaces %}<span class="tag">{{ options.spaces[s] }}</span>{% endfor %}
+          {% for h in house.household %}<span class="tag tag-accent">{{ options.household[h] }}</span>{% endfor %}
+          {% for p in house.priorities %}<span class="tag tag-accent">{{ options.priorities[p] }}</span>{% endfor %}
+        </div>
+      </div>
+      <div class="head-actions">
+        <a class="btn" href="{{ url_for('plan') }}">새 플랜</a>
+        <form method="post" action="{{ url_for('plan_delete', plan_id=plan.id) }}" onsubmit="return confirm('이 기록을 삭제할까요?')">
+          <button class="btn btn-ghost" type="submit">삭제</button>
+        </form>
+      </div>
+    </div>
+
+    <section class="stats">
+      <div class="stat"><span>추천 기기</span><strong>{{ result.count }}종</strong></div>
+      <div class="stat"><span>예산 내 구매</span><strong>{{ result.in_budget_total|won }}</strong></div>
+      <div class="stat"><span>전체 구성 비용</span><strong>{{ result.total|won }}</strong></div>
+      <div class="stat"><span>예산</span><strong>{{ budgets[house.budget].label }}</strong></div>
+    </section>
+
+    {% for group in result.groups %}
+    <section class="group">
+      <h2>{{ group.label }}</h2>
+      <div class="grid">
+        {% for item in group["items"] %}
+        <article class="product{% if not item.in_budget %} over{% endif %}">
+          <img src="{{ url_for('static', filename=item.image) }}" alt="{{ item.name }}">
+          <div class="product-body">
+            <div class="product-top">
+              <h3>{{ item.name }}</h3>
+              {% if item.qty > 1 %}<span class="qty">× {{ item.qty }}</span>{% endif %}
+            </div>
+            <p class="desc">{{ item.desc }}</p>
+            <div class="reasons">{% for r in item.reasons %}<span>{{ r }}</span>{% endfor %}</div>
+            <div class="product-foot">
+              <strong>{{ item.subtotal|won }}</strong>
+              {% if item.in_budget %}<span class="badge ok">예산 내</span>{% else %}<span class="badge">추후 구매</span>{% endif %}
+            </div>
+          </div>
+        </article>
+        {% endfor %}
+      </div>
+    </section>
+    {% endfor %}
+    {% endblock %}
+  rules.json: |
+    {
+      "options": {
+        "housing": {"apartment": "아파트", "officetel": "오피스텔", "oneroom": "원룸", "house": "단독주택"},
+        "spaces": {"living": "거실", "kitchen": "주방", "bedroom": "침실", "study": "서재", "bathroom": "욕실", "entrance": "현관", "balcony": "베란다"},
+        "household": {"single": "1인 가구", "pet": "반려동물", "elderly": "노약자", "child": "영유아"},
+        "priorities": {"security": "보안", "energy": "에너지 절약", "convenience": "생활 편의", "safety": "화재·가스 안전"}
+      },
+      "budgets": {
+        "low": {"label": "30만원 이하", "limit": 300000},
+        "mid": {"label": "80만원 이하", "limit": 800000},
+        "high": {"label": "제한 없음", "limit": null}
+      },
+      "groups": {
+        "base": "기본 인프라",
+        "entrance": "현관",
+        "living": "거실",
+        "kitchen": "주방",
+        "bedroom": "침실",
+        "study": "서재",
+        "bathroom": "욕실",
+        "balcony": "베란다",
+        "care": "가족 맞춤",
+        "extra": "목적별 추가"
+      },
+      "group_order": ["base", "entrance", "living", "kitchen", "bedroom", "study", "bathroom", "balcony", "care", "extra"],
+      "products": {
+        "hub":      {"name": "스마트 허브",        "price": 69000,  "priority": 1, "image": "hub.svg",      "desc": "Zigbee·Matter 기기를 하나로 묶어 앱과 자동화를 관리합니다."},
+        "plug":     {"name": "스마트 플러그",      "price": 15000,  "priority": 2, "image": "plug.svg",     "desc": "일반 가전을 원격으로 켜고 끄며 전력 사용량을 확인합니다."},
+        "mesh":     {"name": "메시 Wi-Fi",         "price": 189000, "priority": 2, "image": "mesh.svg",     "desc": "넓은 집에서도 끊김 없이 모든 기기를 연결합니다."},
+        "doorlock": {"name": "스마트 도어락",      "price": 249000, "priority": 1, "image": "doorlock.svg", "desc": "앱·지문·비밀번호로 열고 출입 기록을 남깁니다."},
+        "motion":   {"name": "모션 센서",          "price": 19000,  "priority": 2, "image": "motion.svg",   "desc": "사람의 움직임을 감지해 조명을 켜거나 알림을 보냅니다."},
+        "contact":  {"name": "문열림 센서",        "price": 15000,  "priority": 2, "image": "contact.svg",  "desc": "창문·방문이 열리면 즉시 알림을 보냅니다."},
+        "cctv":     {"name": "실내 홈캠",          "price": 59000,  "priority": 2, "image": "cctv.svg",     "desc": "외출 중에도 집 안을 실시간으로 확인합니다."},
+        "outdoor":  {"name": "실외 보안 카메라",   "price": 129000, "priority": 2, "image": "outdoor.svg",  "desc": "마당·대문 주변을 야간에도 녹화합니다."},
+        "light":    {"name": "스마트 조명 스위치", "price": 39000,  "priority": 1, "image": "light.svg",    "desc": "기존 벽 스위치를 교체해 조명을 원격·예약 제어합니다."},
+        "bulb":     {"name": "스마트 전구",        "price": 15000,  "priority": 2, "image": "bulb.svg",     "desc": "밝기와 색온도를 조절해 수면·집중 모드를 만듭니다."},
+        "air":      {"name": "공기질 센서",        "price": 79000,  "priority": 2, "image": "air.svg",      "desc": "미세먼지·CO2를 측정해 환기 시점을 알려줍니다."},
+        "ir":       {"name": "스마트 IR 리모컨",   "price": 29000,  "priority": 2, "image": "ir.svg",       "desc": "에어컨·TV 같은 적외선 가전을 앱으로 제어합니다."},
+        "speaker":  {"name": "AI 스피커",          "price": 99000,  "priority": 3, "image": "speaker.svg",  "desc": "음성으로 조명·가전을 제어하고 루틴을 실행합니다."},
+        "curtain":  {"name": "스마트 커튼 모터",   "price": 129000, "priority": 3, "image": "curtain.svg",  "desc": "기상·외출 시간에 맞춰 커튼을 자동으로 여닫습니다."},
+        "thermo":   {"name": "온습도 센서",        "price": 19000,  "priority": 2, "image": "thermo.svg",   "desc": "실내 온도·습도를 기록하고 냉난방 자동화에 활용합니다."},
+        "gas":      {"name": "가스 누출 감지기",   "price": 39000,  "priority": 1, "image": "gas.svg",      "desc": "가스가 새면 경보음과 함께 휴대폰으로 알립니다."},
+        "valve":    {"name": "스마트 가스밸브",    "price": 69000,  "priority": 2, "image": "valve.svg",    "desc": "외출 후에도 앱으로 가스 밸브를 잠급니다."},
+        "smoke":    {"name": "연기 감지기",        "price": 29000,  "priority": 1, "image": "smoke.svg",    "desc": "화재 초기에 연기를 감지해 경보를 울립니다."},
+        "leak":     {"name": "누수 센서",          "price": 19000,  "priority": 1, "image": "leak.svg",     "desc": "바닥에 물이 닿으면 즉시 알려 침수 피해를 막습니다."},
+        "energy":   {"name": "전력량 모니터",      "price": 49000,  "priority": 2, "image": "energy.svg",   "desc": "집 전체 전력 사용량을 실시간으로 보여줍니다."},
+        "petcam":   {"name": "펫 카메라",          "price": 79000,  "priority": 2, "image": "petcam.svg",   "desc": "반려동물을 지켜보고 대화하며 간식을 줄 수 있습니다."},
+        "feeder":   {"name": "자동 급식기",        "price": 99000,  "priority": 3, "image": "feeder.svg",   "desc": "정해진 시간에 정량의 사료를 급여합니다."},
+        "fall":     {"name": "낙상 감지 센서",     "price": 149000, "priority": 1, "image": "fall.svg",     "desc": "레이더로 넘어짐을 감지해 가족에게 알립니다."},
+        "sos":      {"name": "비상 호출 버튼",     "price": 25000,  "priority": 1, "image": "sos.svg",      "desc": "누르면 등록된 가족에게 즉시 호출 알림을 보냅니다."}
+      },
+      "rules": [
+        {"group": "base",     "when": {"always": true},                              "reason": "모든 스마트 기기의 기반",            "products": [{"id": "hub"}, {"id": "plug", "qty": 2}]},
+        {"group": "base",     "when": {"min_area": 30},                              "reason": "30평 이상은 Wi-Fi 음영 구역이 생김",  "products": [{"id": "mesh"}]},
+        {"group": "base",     "when": {"housing": ["house"]},                        "reason": "단독주택은 층·벽이 많아 신호가 약함", "products": [{"id": "mesh"}]},
+        {"group": "entrance", "when": {"space": "entrance"},                         "reason": "현관 출입 관리",                     "products": [{"id": "doorlock"}, {"id": "motion"}]},
+        {"group": "living",   "when": {"space": "living"},                           "reason": "가족이 가장 오래 머무는 공간",        "products": [{"id": "light"}, {"id": "air"}, {"id": "ir"}]},
+        {"group": "kitchen",  "when": {"space": "kitchen"},                          "reason": "불과 가스를 쓰는 공간",              "products": [{"id": "gas"}, {"id": "smoke"}]},
+        {"group": "bedroom",  "when": {"space": "bedroom"},                          "reason": "방마다 수면 조명과 온습도 관리",      "products": [{"id": "bulb", "qty": "rooms"}, {"id": "thermo", "qty": "rooms"}]},
+        {"group": "study",    "when": {"space": "study"},                            "reason": "집중을 위한 조명·공기 관리",          "products": [{"id": "bulb"}, {"id": "air"}]},
+        {"group": "bathroom", "when": {"space": "bathroom"},                         "reason": "물을 쓰는 공간의 누수 대비",          "products": [{"id": "leak"}]},
+        {"group": "balcony",  "when": {"space": "balcony"},                          "reason": "세탁기 누수와 창문 열림 확인",        "products": [{"id": "leak"}, {"id": "contact"}]},
+        {"group": "care",     "when": {"household": "pet"},                          "reason": "혼자 있는 반려동물 돌봄",            "products": [{"id": "petcam"}, {"id": "feeder"}]},
+        {"group": "care",     "when": {"household": "elderly"},                      "reason": "노약자의 응급 상황 대비",            "products": [{"id": "fall"}, {"id": "sos"}]},
+        {"group": "care",     "when": {"household": "child"},                        "reason": "아이 방 확인과 안전",                "products": [{"id": "cctv"}, {"id": "contact"}, {"id": "smoke"}]},
+        {"group": "care",     "when": {"household": "single", "priority": "security"}, "reason": "1인 가구 외출 중 집 확인",         "products": [{"id": "cctv"}]},
+        {"group": "extra",    "when": {"priority": "security"},                      "reason": "보안 우선: 침입 감지",               "products": [{"id": "contact", "qty": "rooms"}, {"id": "cctv"}]},
+        {"group": "extra",    "when": {"priority": "security", "housing": ["house"]}, "reason": "단독주택 외부 감시",                "products": [{"id": "outdoor"}]},
+        {"group": "extra",    "when": {"priority": "energy"},                        "reason": "에너지 절약: 대기전력 차단과 사용량 확인", "products": [{"id": "plug", "qty": 4}, {"id": "energy"}]},
+        {"group": "extra",    "when": {"priority": "convenience"},                   "reason": "생활 편의: 음성 제어",               "products": [{"id": "speaker"}]},
+        {"group": "extra",    "when": {"priority": "convenience", "space": "living"}, "reason": "생활 편의: 커튼 자동화",            "products": [{"id": "curtain"}]},
+        {"group": "extra",    "when": {"priority": "safety"},                        "reason": "안전 우선: 화재 조기 감지",           "products": [{"id": "smoke"}]},
+        {"group": "extra",    "when": {"priority": "safety", "space": "kitchen"},    "reason": "안전 우선: 가스 원격 차단",           "products": [{"id": "valve"}]}
+      ]
+    }
+  signup.html: |
+    {% extends "base.html" %}
+    {% block title %}회원가입 · {{ config.APP_TITLE }}{% endblock %}
+    {% block content %}
+    <section class="auth card">
+      <h1>회원가입</h1>
+      <form method="post">
+        <label>아이디<input name="username" required pattern="[A-Za-z0-9_]{3,20}" autocomplete="username"
+               title="영문, 숫자, _ 로 3~20자"></label>
+        <label>비밀번호<input name="password" type="password" required minlength="6" autocomplete="new-password"></label>
+        <button class="btn btn-block" type="submit">가입하기</button>
+      </form>
+      <p class="muted">이미 계정이 있으신가요? <a href="{{ url_for('login') }}">로그인</a></p>
+    </section>
+    {% endblock %}

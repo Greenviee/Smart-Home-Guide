@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}회원가입 · {{ config.APP_TITLE }}{% endblock %}
+{% block content %}
+<section class="auth card">
+  <h1>회원가입</h1>
+  <form method="post">
+    <label>아이디<input name="username" required pattern="[A-Za-z0-9_]{3,20}" autocomplete="username"
+           title="영문, 숫자, _ 로 3~20자"></label>
+    <label>비밀번호<input name="password" type="password" required minlength="6" autocomplete="new-password"></label>
+    <button class="btn btn-block" type="submit">가입하기</button>
+  </form>
+  <p class="muted">이미 계정이 있으신가요? <a href="{{ url_for('login') }}">로그인</a></p>
+</section>
+{% endblock %}

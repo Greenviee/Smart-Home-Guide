@@ -1,0 +1,17 @@
+# 클러스터 내부 전용 DB 주소 (web Pod가 smarthome-db:5432 로 접속)
+apiVersion: v1
+kind: Service
+metadata:
+  name: smarthome-db
+  labels:
+    app: smarthome
+    component: db
+    app.kubernetes.io/part-of: smarthome
+spec:
+  selector:
+    app: smarthome
+    component: db
+  ports:
+    - name: postgresql
+      port: 5432
+      targetPort: 5432
