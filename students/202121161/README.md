@@ -309,6 +309,7 @@ route.route.openshift.io/smarthome-web   smarthome-web-jinwoo1213-dev.apps.rm3.7
 | 도구 | 용도 |
 |---|---|
 | Claude (Claude Code) | 주제의 난이도 적합성 검토 |
+| Claude (Claude Code) | yaml 코드 검토 및 주석 작성 |
 | Claude (Claude Code) | 웹 프론트엔드 구성: 메인·입력 폼·추천 결과·기록 화면 설계와 모바일 반응형 레이아웃 적용 |
 | Claude (Claude Code) | README 작성: 필수 7개 섹션 구성, 아키텍처·Object·Probe 설계 설명 정리 |
 | Claude (Claude Code) | 최종 테스트 진행: Sandbox 배포 상태(Pod, Route, `/readyz`) 점검과 회원가입 → 로그인 → 추천 저장 흐름 검증 |
