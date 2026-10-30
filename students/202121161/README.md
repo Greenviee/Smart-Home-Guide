@@ -156,15 +156,15 @@ python src/app/app.py                 # http://localhost:8080
 students/202121161/
 ├── README.md
 ├── k8s/                         ← 채점 대상 (oc apply -f k8s/)
-│   ├── 01-secret.yaml
-│   ├── 02-pvc.yaml
-│   ├── 03-db-deployment.yaml
-│   ├── 04-db-service.yaml
-│   ├── 05-configmap-app.yaml    ← src/app 자동 생성
-│   ├── 06-configmap-static.yaml ← src/static 자동 생성
-│   ├── 07-web-deployment.yaml
-│   ├── 08-web-service.yaml
-│   └── 09-route.yaml
+│   ├── configmap-app.yaml       ← src/app 자동 생성
+│   ├── configmap-static.yaml    ← src/static 자동 생성
+│   ├── db-deployment.yaml
+│   ├── db-service.yaml
+│   ├── pvc.yaml
+│   ├── route.yaml
+│   ├── secret.yaml
+│   ├── web-deployment.yaml
+│   └── web-service.yaml
 ├── src/
 │   ├── app/                     ← app.py, 템플릿, rules.json
 │   ├── static/                  ← style.css, 제품 SVG

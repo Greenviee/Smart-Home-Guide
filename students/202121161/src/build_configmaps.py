@@ -10,8 +10,8 @@ K8S = os.path.join(SRC, "..", "k8s")
 
 TARGETS = [
     # (ConfigMap 이름, 원본 폴더, 출력 파일, 설명)
-    ("smarthome-app", "app", "05-configmap-app.yaml", "Flask 앱 코드, HTML 템플릿, 추천 규칙"),
-    ("smarthome-static", "static", "06-configmap-static.yaml", "CSS와 제품 예시 이미지(SVG)"),
+    ("smarthome-app", "app", "configmap-app.yaml", "Flask 앱 코드, HTML 템플릿, 추천 규칙"),
+    ("smarthome-static", "static", "configmap-static.yaml", "CSS와 제품 예시 이미지(SVG)"),
 ]
 EXTENSIONS = (".py", ".html", ".json", ".css", ".svg")
 
