@@ -267,6 +267,11 @@ def login_required(view):
         if "user_id" not in session:
             flash("로그인이 필요합니다.")
             return redirect(url_for("login", next=request.path))
+        # DB가 초기화되면(재배포 등) 쿠키 속 user_id가 더 이상 없을 수 있다.
+        if not query("SELECT id FROM users WHERE id = ?", (session["user_id"],), one=True):
+            session.clear()
+            flash("로그인 정보가 만료되었습니다. 다시 로그인해 주세요.")
+            return redirect(url_for("login", next=request.path))
         return view(*args, **kwargs)
     return wrapper
 
